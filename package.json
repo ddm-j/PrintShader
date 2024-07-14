@@ -9,9 +9,11 @@
     "preview": "vite preview"
   },
   "devDependencies": {
-    "vite": "^5.3.1"
+    "vite": "^5.3.3"
   },
   "dependencies": {
+    "postprocessing": "^6.35.6",
+    "realism-effects": "^1.1.2",
     "three": "^0.166.1"
   }
 }
