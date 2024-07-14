@@ -6,17 +6,29 @@ import { OrbitControls } from 'three/examples/jsm/Addons.js';
 import { EffectComposer } from 'three/examples/jsm/Addons.js';
 import { RenderPass } from 'three/examples/jsm/Addons.js';
 import { SMAAPass } from 'three/examples/jsm/Addons.js';
+import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
 import { TAARenderPass } from 'three/addons/postprocessing/TAARenderPass.js';
 import { OutputPass } from 'three/examples/jsm/Addons.js';
-import './shader/MyShaderChunks.js';
+import { loadShader } from "./utils.js";
+import './shader/NoiseShaderChunks.js';
+import setupShader from './shader/PrintShaderChunk.js';
 
-// Shader Loader
-async function loadShader(url) {
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`Failed to load shader from ${url}: ${response.statusText}`);
-  }
-  return response.text();
+async function preloadShaders() {
+  const PrintNormalShader = await setupShader();  // Ensure this fully resolves before continuing
+  return PrintNormalShader;
+}
+
+function downloadShaderCode(filename, content) {
+  const element = document.createElement('a');
+  element.setAttribute('href', 'data:text/plain;charset=utf-8,' + encodeURIComponent(content));
+  element.setAttribute('download', filename);
+
+  element.style.display = 'none';
+  document.body.appendChild(element);
+
+  element.click();
+
+  document.body.removeChild(element);
 }
 
 // Scene Initialization
@@ -36,9 +48,24 @@ async function init() {
   })
   renderer.setPixelRatio(window.devicePixelRatio);
   renderer.setSize( window.innerWidth, window.innerHeight);
-  // renderer.render( scene, camera );
-
   document.body.appendChild(renderer.domElement);
+
+  // Composer
+  const composer = new EffectComposer( renderer );
+  composer.addPass( new RenderPass( scene, camera ) );
+
+  const smaaPass = new SMAAPass( window.innerWidth * renderer.getPixelRatio(), window.innerHeight * renderer.getPixelRatio() );
+  smaaPass.enabled = true;
+  composer.addPass( smaaPass );
+
+  const gtaoPass = new GTAOPass( scene, camera, renderer.innerWidth, renderer.innerHeight );
+  gtaoPass.output = GTAOPass.OUTPUT.Default;
+  gtaoPass.enabled = true;
+  // .enabled = true;
+  composer.addPass( gtaoPass );
+
+  const outputPass = new OutputPass();
+  composer.addPass( outputPass );
 
   // Add Geometry
   const loader = new STLLoader();
@@ -68,29 +95,77 @@ async function init() {
     // Lighting
     // const ambientLight = new THREE.AmbientLight(0xffffff);
     // scene.add(ambientLight);
-    const directionalLight = new THREE.DirectionalLight(0xffffff, 5);
-    directionalLight.position.set(maxSize, maxSize, maxSize);
-    scene.add(directionalLight);
+    const l1 = new THREE.DirectionalLight(0xffffff, 1);
+    l1.position.set(maxSize, maxSize, maxSize);
+
+    const l2 = new THREE.DirectionalLight(0xffffff, 1);
+    l2.position.set(-maxSize, maxSize, maxSize);
+
+    const l3 = new THREE.DirectionalLight(0xffffff, 1);
+    l3.position.set(-maxSize, -maxSize, maxSize);
+
+    const l4 = new THREE.DirectionalLight(0xffffff, 1);
+    l4.position.set(maxSize, -maxSize, maxSize);
+    scene.add(l1, l2, l3, l4);
 
     // Load the Shaders
     const vertexShader = await loadShader('./shader/vertexShader.glsl');
     const fragmentShader = await loadShader('./shader/fragmentShader.glsl');
 
-    // Mesh Material
-    const material = new THREE.ShaderMaterial({
-      vertexShader: vertexShader,
-      fragmentShader: fragmentShader,
-      uniforms: {
-          baseColor: { value: new THREE.Color(1.0, 0.0, 0.0) }, // Example: A nice purple
-          height: { value: size.z },
-          layerThickness: { value: 0.5 },
-          layerWidth: { value: 0.45 },
-          distortionScale: { value: 0.010},
-          lightColor: {value: new THREE.Color(1, 1, 1)},
-          lightDirection: {value: directionalLight.position.clone().normalize()},
-          viewDirection: {value: camera.position.clone()}
-    }});
+    // Custom Material w/ Shader Injection
+    const PrintNormalShader = await preloadShaders();
+    const material = new THREE.MeshPhysicalMaterial({
+      color: new THREE.Color(230.0/255, 25.0/255, 7.0/255),
+      roughness: 0.4,
+      ior: 1.45,
+      normalMapType: THREE.ObjectSpaceNormalMap,
+      alphaHash: true,
+      aoMap: gtaoPass.aoMap
+    });
+    material.onBeforeCompile = function (shader) {
+        shader.uniforms.height = { value: size.z };
+        shader.uniforms.layerThickness = { value: 0.25 };
+        shader.uniforms.layerWidth = { value: 0.45 };
+        shader.uniforms.distortionScale = { value: 0.020};
+
+        // Inject uNormal & uPosition into the vertex shader (world position/normal)
+        shader.vertexShader = shader.vertexShader.replace(
+          `#include <common>`,
+          `#include <common>
+          varying vec3 uPosition;
+          varying vec3 uNormal;`
+        );
+        shader.vertexShader = shader.vertexShader.replace(
+          `#include <begin_vertex>`,
+          `#include <begin_vertex>
+          uNormal = objectNormal;`
+        );
+
+        // Inject Layer Calculation Functions
+        shader.fragmentShader = shader.fragmentShader.replace(
+            '#include <common>',
+            `#include <common>\n${PrintNormalShader.normalCalculation}`
+        );
+
+        // Compute custom normal map/coloring
+        shader.fragmentShader = shader.fragmentShader.replace(
+            '#include <normal_fragment_maps>',
+            `vec4 customNormal = printLayerNormals(vPosition, normal, uNormal);
+            normal = customNormal.xyz;
+            float layers = customNormal.w;
+            float layersColor = 1.0 - layers*0.5;
+            diffuseColor *= max(0.8, layers);`
+        );
+
+        // Debug output
+        // shader.fragmentShader = shader.fragmentShader.replace(
+        //     '#include <dithering_fragment>',
+        //     `#include <dithering_fragment>
+        //     gl_FragColor = vec4(uNormal, 1.0);`
+        // );
+        };
     const mesh = new THREE.Mesh( geometry, material );
+    mesh.castShadow = true;
 
     // Axis Helper
     const axesHelper = new THREE.AxesHelper( 10 );
@@ -102,16 +177,6 @@ async function init() {
     scene.add( mesh );
 
   } );
-
-  // Composer
-  const composer = new EffectComposer( renderer );
-  composer.addPass( new RenderPass( scene, camera ) );
-
-  const smaaPass = new SMAAPass( window.innerWidth * renderer.getPixelRatio(), window.innerHeight * renderer.getPixelRatio() );
-  composer.addPass( smaaPass );
-
-  const outputPass = new OutputPass();
-  composer.addPass( outputPass );
 
   // Grid Helper
   const gridHelper = new THREE.GridHelper(350, 35);
